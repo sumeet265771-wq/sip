@@ -62,6 +62,10 @@ type CallInfo struct {
 	Call    *rpc.SIPCall
 	Pin     string
 	NoPin   bool
+
+	// SIPREC-specific fields
+	IsSiprec    bool   // true if this is a SIPREC call
+	SiprecLabel string // "inbound" or "outbound" for SIPREC legs
 }
 
 type AuthResult int
@@ -157,6 +161,9 @@ type Server struct {
 	sconf   *ServiceConfig
 
 	res mediaRes
+
+	// SIPREC session tracking
+	siprecSessions *SiprecSessionStore
 }
 
 type inProgressInvite struct {
@@ -179,15 +186,16 @@ func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats
 		log = logger.GetLogger()
 	}
 	s := &Server{
-		log:         log,
-		conf:        conf,
-		region:      region,
-		mon:         mon,
-		getIOClient: getIOClient,
-		getRoom:     DefaultGetRoomFunc,
-		byRemoteTag: make(map[RemoteTag]*inboundCall),
-		byLocalTag:  make(map[LocalTag]*inboundCall),
-		byCallID:    make(map[string]*inboundCall),
+		log:            log,
+		conf:           conf,
+		region:         region,
+		mon:            mon,
+		getIOClient:    getIOClient,
+		getRoom:        DefaultGetRoomFunc,
+		byRemoteTag:    make(map[RemoteTag]*inboundCall),
+		byLocalTag:     make(map[LocalTag]*inboundCall),
+		byCallID:       make(map[string]*inboundCall),
+		siprecSessions: NewSiprecSessionStore(log),
 	}
 	for _, option := range options {
 		option(s)
@@ -342,6 +350,10 @@ func (s *Server) Stop() {
 	s.cmu.Unlock()
 	for _, c := range calls {
 		_ = c.Close()
+	}
+	// Clean up SIPREC sessions
+	if s.siprecSessions != nil {
+		s.siprecSessions.Clear()
 	}
 	if s.sipSrv != nil {
 		_ = s.sipSrv.Close()

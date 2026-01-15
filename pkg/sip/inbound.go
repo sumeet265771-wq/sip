@@ -280,6 +280,11 @@ func (s *Server) onInvite(log *slog.Logger, req *sip.Request, tx sip.ServerTrans
 }
 
 func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retErr error) {
+	// Check if this is a SIPREC INVITE and handle it separately
+	if IsSiprecInvite(req) {
+		return s.processSiprecInvite(req, tx)
+	}
+
 	start := time.Now()
 	var state *CallState
 	ctx := context.Background()
@@ -470,6 +475,11 @@ func (s *Server) onOptions(log *slog.Logger, req *sip.Request, tx sip.ServerTran
 }
 
 func (s *Server) onAck(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	// Check if this is an ACK for a SIPREC session
+	if s.handleSiprecAck(req) {
+		return
+	}
+
 	tag, err := getFromTag(req)
 	if err != nil {
 		return
@@ -485,6 +495,11 @@ func (s *Server) onAck(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 }
 
 func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	// Check if this is a BYE for a SIPREC session
+	if s.handleSiprecBye(req, tx) {
+		return
+	}
+
 	tag, err := getFromTag(req)
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "", nil))

@@ -439,7 +439,18 @@ func (s *Server) processSiprecLeg(
 		roomConf.Participant.Name = fmt.Sprintf("SIPREC %s", label)
 	}
 
-	// Add SIPREC attributes to participant
+	// Apply headers_to_attributes from dispatch rules (same as regular SIP calls)
+	// Use the original SIPREC INVITE headers to extract attributes
+	originalHeaders := Headers(session.OriginalInvite.Headers())
+	roomConf.Participant.Attributes = HeadersToAttrs(
+		roomConf.Participant.Attributes,
+		disp.HeadersToAttributes,
+		disp.IncludeHeaders,
+		nil, // No signaling interface, use headers directly
+		originalHeaders,
+	)
+
+	// Add SIPREC-specific attributes to participant
 	if roomConf.Participant.Attributes == nil {
 		roomConf.Participant.Attributes = make(map[string]string)
 	}

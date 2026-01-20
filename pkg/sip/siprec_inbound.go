@@ -626,32 +626,105 @@ func (s *Server) respondSiprecError(tx sip.ServerTransaction, req *sip.Request, 
 }
 
 // cleanupSiprecSession removes a SIPREC session and its associated resources.
+// This properly closes the LiveKit room connections for each leg.
 func (s *Server) cleanupSiprecSession(sipCallID string) {
 	session, exists := s.siprecSessions.Get(sipCallID)
 	if !exists {
 		return
 	}
 
-	s.log.Debugw("Cleaning up SIPREC session", "sipCallID", sipCallID)
+	s.log.Infow("Cleaning up SIPREC session", "sipCallID", sipCallID)
 
 	// Clean up leg A
 	if session.LegA != nil && session.LegA.Call != nil {
-		s.cmu.Lock()
-		delete(s.byLocalTag, session.LegA.Call.cc.ID())
-		s.cmu.Unlock()
-		_ = session.LegA.Call.Close()
+		s.closeSiprecLeg(session.LegA.Call, "A", session.LegA.Label)
 	}
 
 	// Clean up leg B
 	if session.LegB != nil && session.LegB.Call != nil {
-		s.cmu.Lock()
-		delete(s.byLocalTag, session.LegB.Call.cc.ID())
-		s.cmu.Unlock()
-		_ = session.LegB.Call.Close()
+		s.closeSiprecLeg(session.LegB.Call, "B", session.LegB.Label)
 	}
+
+	// Cancel the session context
+	session.Cancel()
 
 	// Remove from session store
 	s.siprecSessions.Delete(sipCallID)
+
+	s.log.Infow("SIPREC session cleaned up", "sipCallID", sipCallID)
+}
+
+// closeSiprecLeg properly closes a single SIPREC leg, including the LiveKit room.
+func (s *Server) closeSiprecLeg(call *inboundCall, legID, label string) {
+	if call == nil {
+		return
+	}
+
+	log := call.log()
+	if log == nil {
+		log = s.log
+	}
+	log.Infow("Closing SIPREC leg", "legID", legID, "label", label)
+
+	// Update call state to disconnected
+	if call.state != nil {
+		call.state.Update(context.Background(), func(info *livekit.SIPCallInfo) {
+			info.CallStatus = livekit.SIPCallStatus_SCS_DISCONNECTED
+			info.EndedAtNs = time.Now().UnixNano()
+			info.DisconnectReason = livekit.DisconnectReason_CLIENT_INITIATED
+		})
+	}
+
+	// Close the media port (stops receiving RTP)
+	if call.media != nil {
+		call.media.Close()
+		log.Debugw("SIPREC leg media closed")
+	}
+
+	// Close the LiveKit room connection (removes participant from room)
+	if call.lkRoom != nil {
+		if err := call.lkRoom.CloseWithReason(livekit.DisconnectReason_CLIENT_INITIATED); err != nil {
+			log.Warnw("Error closing SIPREC leg room", err)
+		} else {
+			log.Debugw("SIPREC leg room closed")
+		}
+	}
+
+	// Call the session end handler
+	if s.handler != nil && call.call != nil {
+		go func() {
+			ctx := context.Background()
+			var callInfo *livekit.SIPCallInfo
+			if call.state != nil {
+				callInfo = call.state.callInfo
+			}
+			s.handler.OnSessionEnd(ctx, &CallIdentifier{
+				ProjectID: call.projectID,
+				CallID:    call.call.LkCallId,
+				SipCallID: call.call.SipCallId,
+			}, callInfo, "siprec-bye")
+		}()
+	}
+
+	// Remove from server maps
+	if call.cc != nil {
+		s.cmu.Lock()
+		delete(s.byLocalTag, call.cc.ID())
+		s.cmu.Unlock()
+	}
+
+	// Cancel the call context
+	call.cancel()
+
+	// Update monitor stats
+	if call.mon != nil {
+		call.mon.CallTerminate("siprec-bye")
+		if call.callDur != nil {
+			call.callDur()
+		}
+	}
+
+	log.Infow("SIPREC leg closed", "legID", legID, "label", label)
 }
 
 // handleSiprecBye handles BYE requests for SIPREC sessions.

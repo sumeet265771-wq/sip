@@ -504,15 +504,27 @@ func (s *Server) processSiprecLeg(
 		return "", errors.Wrap(err, "media setup failed")
 	}
 
-	// Join the room - use the SHARED room config from the session dispatch
-	// This ensures both SIPREC legs (A and B) join the same room with a valid token
+	// Build room config using shared dispatch for room/token, but per-leg for participant
+	// This ensures:
+	// 1. Both legs join the same room with a valid token (from shared dispatch)
+	// 2. Each leg has its own unique participant identity and attributes
 	var roomConf RoomConfig
 	if session.SharedDispatch != nil {
-		// Use the shared dispatch's room config (includes valid token for the shared room)
-		roomConf = session.SharedDispatch.Room
+		// Copy connection settings from shared dispatch (token is valid for shared room)
+		roomConf.WsUrl = session.SharedDispatch.Room.WsUrl
+		roomConf.Token = session.SharedDispatch.Room.Token
+		roomConf.RoomName = session.SharedDispatch.Room.RoomName
+		roomConf.RoomPreset = session.SharedDispatch.Room.RoomPreset
+		roomConf.RoomConfig = session.SharedDispatch.Room.RoomConfig
+		roomConf.JitterBuf = session.SharedDispatch.Room.JitterBuf
+		// Use per-leg participant config (fresh copy, not shared reference)
+		roomConf.Participant = disp.Room.Participant
 	} else {
-		// Fallback to per-leg dispatch (shouldn't happen in normal flow)
+		// Fallback to per-leg dispatch entirely
 		roomConf = disp.Room
+		if session.SharedRoomName != "" {
+			roomConf.RoomName = session.SharedRoomName
+		}
 	}
 
 	// Customize participant identity for SIPREC to include the label
@@ -525,7 +537,14 @@ func (s *Server) processSiprecLeg(
 		roomConf.Participant.Name = fmt.Sprintf("SIPREC %s", label)
 	}
 
-	// Apply headers_to_attributes from the shared dispatch rules (same as regular SIP calls)
+	// Create fresh attributes map for this leg (don't share reference with other leg)
+	legAttrs := make(map[string]string)
+	// Copy any existing attributes from dispatch
+	for k, v := range disp.Room.Participant.Attributes {
+		legAttrs[k] = v
+	}
+
+	// Apply headers_to_attributes from the shared dispatch rules
 	// Use the original SIPREC INVITE headers to extract attributes
 	originalHeaders := Headers(session.OriginalInvite.Headers())
 	headersToAttrs := disp.HeadersToAttributes
@@ -534,21 +553,19 @@ func (s *Server) processSiprecLeg(
 		headersToAttrs = session.SharedDispatch.HeadersToAttributes
 		includeHeaders = session.SharedDispatch.IncludeHeaders
 	}
-	roomConf.Participant.Attributes = HeadersToAttrs(
-		roomConf.Participant.Attributes,
+	legAttrs = HeadersToAttrs(
+		legAttrs,
 		headersToAttrs,
 		includeHeaders,
 		nil, // No signaling interface, use headers directly
 		originalHeaders,
 	)
 
-	// Add SIPREC-specific attributes to participant
-	if roomConf.Participant.Attributes == nil {
-		roomConf.Participant.Attributes = make(map[string]string)
-	}
+	// Add SIPREC-specific attributes for this leg
 	for k, v := range siprecAttrs {
-		roomConf.Participant.Attributes[k] = v
+		legAttrs[k] = v
 	}
+	roomConf.Participant.Attributes = legAttrs
 
 	log.Infow("SIPREC leg joining room",
 		"room", roomConf.RoomName,

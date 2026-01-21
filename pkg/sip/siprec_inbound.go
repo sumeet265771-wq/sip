@@ -446,13 +446,20 @@ func (s *Server) processSiprecLeg(
 
 	// Update call state with dispatch info
 	// Use the shared room name from the session to ensure consistency
-	roomName := disp.Room.RoomName
-	if session.SharedRoomName != "" {
-		roomName = session.SharedRoomName
+	roomName := session.SharedRoomName
+	if roomName == "" {
+		roomName = disp.Room.RoomName
 	}
+
+	// Use dispatch rule ID from the shared session dispatch for consistency
+	dispatchRuleID := disp.DispatchRuleID
+	if session.SharedDispatch != nil && session.SharedDispatch.DispatchRuleID != "" {
+		dispatchRuleID = session.SharedDispatch.DispatchRuleID
+	}
+
 	state.Update(ctx, func(info *livekit.SIPCallInfo) {
 		info.TrunkId = disp.TrunkID
-		info.DispatchRuleId = disp.DispatchRuleID
+		info.DispatchRuleId = dispatchRuleID
 		info.RoomName = roomName
 		info.ParticipantIdentity = disp.Room.Participant.Identity
 		info.ParticipantAttributes = disp.Room.Participant.Attributes
@@ -497,11 +504,15 @@ func (s *Server) processSiprecLeg(
 		return "", errors.Wrap(err, "media setup failed")
 	}
 
-	// Join the room - use the SHARED room name from the session
-	// This ensures both SIPREC legs (A and B) join the same room
-	roomConf := disp.Room
-	if session.SharedRoomName != "" {
-		roomConf.RoomName = session.SharedRoomName
+	// Join the room - use the SHARED room config from the session dispatch
+	// This ensures both SIPREC legs (A and B) join the same room with a valid token
+	var roomConf RoomConfig
+	if session.SharedDispatch != nil {
+		// Use the shared dispatch's room config (includes valid token for the shared room)
+		roomConf = session.SharedDispatch.Room
+	} else {
+		// Fallback to per-leg dispatch (shouldn't happen in normal flow)
+		roomConf = disp.Room
 	}
 
 	// Customize participant identity for SIPREC to include the label
@@ -514,13 +525,19 @@ func (s *Server) processSiprecLeg(
 		roomConf.Participant.Name = fmt.Sprintf("SIPREC %s", label)
 	}
 
-	// Apply headers_to_attributes from dispatch rules (same as regular SIP calls)
+	// Apply headers_to_attributes from the shared dispatch rules (same as regular SIP calls)
 	// Use the original SIPREC INVITE headers to extract attributes
 	originalHeaders := Headers(session.OriginalInvite.Headers())
+	headersToAttrs := disp.HeadersToAttributes
+	includeHeaders := disp.IncludeHeaders
+	if session.SharedDispatch != nil {
+		headersToAttrs = session.SharedDispatch.HeadersToAttributes
+		includeHeaders = session.SharedDispatch.IncludeHeaders
+	}
 	roomConf.Participant.Attributes = HeadersToAttrs(
 		roomConf.Participant.Attributes,
-		disp.HeadersToAttributes,
-		disp.IncludeHeaders,
+		headersToAttrs,
+		includeHeaders,
 		nil, // No signaling interface, use headers directly
 		originalHeaders,
 	)

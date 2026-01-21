@@ -43,6 +43,11 @@ type SiprecSession struct {
 	OriginalTx     sip.ServerTransaction
 	OriginalSDP    string
 
+	// Shared room configuration for both legs
+	// This ensures both SIPREC participants join the same room
+	SharedRoomName string
+	SharedDispatch *CallDispatch
+
 	// Split leg tracking
 	LegA *SiprecLeg
 	LegB *SiprecLeg

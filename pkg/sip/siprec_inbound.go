@@ -206,6 +206,71 @@ func (s *Server) handleSiprecCall(
 		"callIDB", callIDB,
 	)
 
+	// Do a single dispatch call for the SIPREC session to get the shared room name.
+	// This ensures both legs join the same room.
+	from := req.From()
+	to := req.To()
+	if from == nil || to == nil {
+		log.Errorw("Missing From/To headers in SIPREC INVITE", nil)
+		s.respondSiprecError(session.OriginalTx, req, sip.StatusBadRequest, "Missing From/To")
+		s.cleanupSiprecSession(session.ID)
+		return
+	}
+
+	// Create a call info for the session-level dispatch
+	sessionCallInfo := &rpc.SIPCall{
+		LkCallId:  lksip.NewCallID(),
+		SipCallId: session.ID,
+		SourceIp:  src.Addr().String(),
+		Address:   ToSIPUri("", req.Recipient),
+		From:      ToSIPUri("", from.Address),
+		To:        ToSIPUri("", to.Address),
+	}
+
+	// Get auth credentials for the session
+	authResult, err := s.handler.GetAuthCredentials(ctx, sessionCallInfo)
+	if err != nil {
+		log.Warnw("Failed to get auth credentials for SIPREC session", err)
+		s.respondSiprecError(session.OriginalTx, req, sip.StatusForbidden, "Auth failed")
+		s.cleanupSiprecSession(session.ID)
+		return
+	}
+
+	if authResult.Result != AuthAccept && authResult.Result != AuthPassword {
+		log.Warnw("SIPREC session auth not accepted", nil, "result", authResult.Result)
+		s.respondSiprecError(session.OriginalTx, req, sip.StatusForbidden, "Not authorized")
+		s.cleanupSiprecSession(session.ID)
+		return
+	}
+
+	// Dispatch the SIPREC session to get the shared room configuration
+	sessionDispatch := s.handler.DispatchCall(ctx, &CallInfo{
+		TrunkID:     authResult.TrunkID,
+		Call:        sessionCallInfo,
+		Pin:         "",
+		NoPin:       true, // SIPREC doesn't use PIN
+		IsSiprec:    true,
+		SiprecLabel: "session", // Mark as session-level dispatch
+	})
+
+	if sessionDispatch.Result != DispatchAccept {
+		log.Warnw("SIPREC session dispatch not accepted", nil, "result", sessionDispatch.Result)
+		s.respondSiprecError(session.OriginalTx, req, sip.StatusServiceUnavailable, "No dispatch rule")
+		s.cleanupSiprecSession(session.ID)
+		return
+	}
+
+	// Store the shared room name in the session
+	// Both legs will use this same room name
+	session.SharedRoomName = sessionDispatch.Room.RoomName
+	session.SharedDispatch = &sessionDispatch
+
+	log.Infow("SIPREC session dispatched",
+		"sharedRoom", session.SharedRoomName,
+		"dispatchRule", sessionDispatch.DispatchRuleID,
+		"trunkID", sessionDispatch.TrunkID,
+	)
+
 	// Process both legs concurrently
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -380,10 +445,15 @@ func (s *Server) processSiprecLeg(
 	}
 
 	// Update call state with dispatch info
+	// Use the shared room name from the session to ensure consistency
+	roomName := disp.Room.RoomName
+	if session.SharedRoomName != "" {
+		roomName = session.SharedRoomName
+	}
 	state.Update(ctx, func(info *livekit.SIPCallInfo) {
 		info.TrunkId = disp.TrunkID
 		info.DispatchRuleId = disp.DispatchRuleID
-		info.RoomName = disp.Room.RoomName
+		info.RoomName = roomName
 		info.ParticipantIdentity = disp.Room.Participant.Identity
 		info.ParticipantAttributes = disp.Room.Participant.Attributes
 	})
@@ -427,8 +497,13 @@ func (s *Server) processSiprecLeg(
 		return "", errors.Wrap(err, "media setup failed")
 	}
 
-	// Join the room
+	// Join the room - use the SHARED room name from the session
+	// This ensures both SIPREC legs (A and B) join the same room
 	roomConf := disp.Room
+	if session.SharedRoomName != "" {
+		roomConf.RoomName = session.SharedRoomName
+	}
+
 	// Customize participant identity for SIPREC to include the label
 	if roomConf.Participant.Identity == "" {
 		roomConf.Participant.Identity = fmt.Sprintf("siprec_%s_%s", label, callID[:8])
